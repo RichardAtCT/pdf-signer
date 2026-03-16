@@ -158,3 +158,71 @@ Write a clear README covering:
 - Usage examples
 - How the detection chain works
 - Contributing / licence (MIT)
+
+---
+
+## Initials Feature (v1.1)
+
+### Overview
+
+Support placing initials stamps on documents — smaller stamps used for page-by-page acknowledgement or mid-document initial boxes, in addition to (or instead of) a full signature.
+
+### Initials Stamp Appearance
+
+- Size: 80×30 points (vs 200×50 for full signature)
+- Content: signer's initials (e.g. "RA") in the same cursive font
+- No date, no "Digitally signed" label — just the initials
+- Auto-derive from `PDF_SIGNER_NAME`: take first letter of each word (e.g. "PDF Signer" → "RA")
+- Override via `PDF_SIGNER_INITIALS` env var or `--initials-text` flag
+- Custom image via `PDF_SIGNER_INITIALS_IMAGE` env var or `--initials-image` flag
+
+### CLI Flags
+
+```bash
+# Place initials at detected/specified location instead of full signature
+python3 scripts/sign.py input.pdf output.pdf --initials
+
+# Place initials on every page at bottom-left corner, then sign
+python3 scripts/sign.py input.pdf output.pdf --initials-all-pages
+
+# Use custom initials text
+python3 scripts/sign.py input.pdf output.pdf --initials --initials-text "RA"
+
+# Use custom initials image
+python3 scripts/sign.py input.pdf output.pdf --initials --initials-image /path/to/initials.png
+```
+
+### Detection for Initials
+
+Extend `detect_fields.py` with `detect_initials_locations()`:
+- Scan for patterns: `[INITIALS]`, `[INIT]`, `/i/`, `Initials:` followed by whitespace
+- Return a list of locations (all matches, not just the first)
+- Vision fallback: ask the model to identify ALL initial boxes on the page
+
+### Multi-placement Flow
+
+When `--initials-all-pages` is set:
+1. Place initials stamp at bottom-left of every page (position: x=20, y=20, consistent)
+2. Then apply the single cryptographic signature (to avoid multiple signing events)
+
+When initials placeholders are detected:
+1. Collect ALL detected initials locations across all pages
+2. Place initials stamps at each location
+3. Apply single cryptographic signature
+
+### Output
+
+Include initials placement in JSON output:
+```json
+{
+  "success": true,
+  "output": "/path/to/signed.pdf",
+  "detection_method": "text_placeholder",
+  "signature_page": 5,
+  "signature_location": {"x": 400, "y": 100},
+  "initials_placed": [
+    {"page": 1, "x": 20, "y": 20},
+    {"page": 2, "x": 20, "y": 20}
+  ]
+}
+```
