@@ -2,23 +2,23 @@
 
 ## Purpose
 
-An OpenClaw agent skill that enables AI agents (Friday and others) to sign PDF documents on behalf of PDF Signer. The skill handles the full pipeline: detecting where a signature is needed, placing it correctly, and producing a signed output PDF.
+A general-purpose command-line tool and OpenClaw agent skill for signing PDF documents. Designed to be used by any AI agent or human operator to apply digital signatures to PDFs on behalf of any configured signer. Supports cryptographic signing via X.509 certificates, automatic signature field detection, and AI-powered location detection for unstructured documents.
 
 ## Stack
 
 - **Language:** Python 3
 - **Signing library:** PyHanko (`pyhanko` package)
-- **Certificate:** Self-signed X.509 cert for PDF Signer (generated on first run, stored in `~/~/.pdf-signer/signer.p12`)
-- **Vision model:** `claude-3-5-sonnet-20241022` via Anthropic API (for unstructured document detection)
+- **Certificate:** Self-signed X.509 cert (generated on first run via `gen_cert.py`), stored as PKCS#12 at a configurable path
+- **Vision model:** `claude-sonnet-4-6` via Anthropic API (for unstructured document detection)
 - **PDF rendering:** `pdf2image` + `poppler` (for converting pages to images for vision inspection)
 
-## Skill Structure
+## Project Structure
 
 ```
-~/.openclaw/skills/pdf-signer/
+pdf-signer/
   SKILL.md              # OpenClaw skill descriptor
   scripts/
-    sign.py             # Main signing script
+    sign.py             # Main signing script (entry point)
     detect_fields.py    # Signature field detection logic
     gen_cert.py         # Generate/check self-signed certificate
     vision_detect.py    # Vision model field detection
@@ -26,13 +26,20 @@ An OpenClaw agent skill that enables AI agents (Friday and others) to sign PDF d
   README.md
 ```
 
-## Certificate
+## Certificate Management
 
-On first use, `gen_cert.py` checks for `~/~/.pdf-signer/signer.p12`. If missing, generates a self-signed cert:
-- Common Name: PDF Signer
-- Email: signer@example.com
-- Valid: 10 years
-- Stored as PKCS#12 (.p12), passphrase in `~/~/.pdf-signer/.cert-pass`
+`gen_cert.py` generates a self-signed X.509 cert if one doesn't exist at the configured path. Configuration via environment variables or CLI flags:
+
+- `PDF_SIGNER_CERT_PATH` — path to .p12 cert file (default: `~/.pdf-signer/signer.p12`)
+- `PDF_SIGNER_CERT_PASS` — passphrase (default: read from `~/.pdf-signer/.cert-pass`)
+- `PDF_SIGNER_NAME` — signer display name (default: read from cert CN)
+- `PDF_SIGNER_EMAIL` — signer email (used in cert generation)
+
+On first run, `gen_cert.py`:
+- Creates `~/.pdf-signer/` directory
+- Generates a random 32-char alphanumeric passphrase, saves to `.cert-pass` (chmod 600)
+- Generates a self-signed cert valid for 10 years
+- Prints the cert path and fingerprint
 
 ## Signature Detection — Priority Chain
 
@@ -42,24 +49,24 @@ When signing a PDF, detect where to place the signature using this chain:
 Use PyHanko to check if the PDF contains existing AcroForm signature fields. If found, sign the first unsigned field. This covers formally-prepared PDFs (DocuSign exports, Adobe forms, etc.).
 
 ### 2. Text Placeholder Scan
-Extract the text layer from the PDF (using `pdfminer.six` or PyHanko's reader). Search for common signature placeholder patterns (case-insensitive):
+Extract the text layer from the PDF. Search for common signature placeholder patterns (case-insensitive):
 - `/s/`
 - `[SIGNATURE]`, `[SIGN HERE]`
 - `{{signature}}`, `{signature}`
 - `________________________` (5+ underscores)
 - `Signature:` followed by blank space
 
-If found, extract the bounding box of the text, place the visible signature stamp just above/at that location.
+If found, extract the bounding box of the matched text and place the visible signature stamp at that location.
 
 ### 3. Vision Model Detection (fallback)
-If no fields or text placeholders are found, render each page as an image (150 DPI, PNG) and send to `claude-sonnet-4-6` with this prompt:
+If no fields or text placeholders are found, render each page as an image (150 DPI, PNG) and send to `claude-sonnet-4-6` via the Anthropic API with this prompt:
 
 > "This is page N of a PDF document. Identify if there is a signature line, signature box, or place where a signature should go. If yes, return a JSON object: {"found": true, "page": N, "x_pct": <0-100>, "y_pct": <0-100>, "description": "..."} where x_pct and y_pct are the percentage position from top-left of the signature location. If no signature location found, return {"found": false}."
 
-Use the returned coordinates (converting percentage to PDF point coordinates) to place the signature.
+Convert returned percentage coordinates to PDF point coordinates for placement.
 
 ### 4. Manual Fallback
-If all three detection methods fail, exit with a clear error message and instructions for the calling agent:
+If all detection methods fail, exit with error and instructions:
 ```
 No signature location detected. Re-run with explicit placement:
   sign.py input.pdf output.pdf --page 1 --x 400 --y 100
@@ -79,48 +86,40 @@ python3 scripts/sign.py input.pdf output.pdf --page 1 --x 400 --y 100 --width 20
 python3 scripts/sign.py input.pdf output.pdf --position last-page-bottom-right
 python3 scripts/sign.py input.pdf output.pdf --position last-page-bottom-left
 
-# Invisible signature only (no visual stamp, just cryptographic)
+# Invisible signature only (cryptographic, no visual stamp)
 python3 scripts/sign.py input.pdf output.pdf --invisible
+
+# Override signer identity
+python3 scripts/sign.py input.pdf output.pdf --name "Jane Smith" --email "jane@example.com"
+
+# Use a specific cert
+python3 scripts/sign.py input.pdf output.pdf --cert /path/to/signer.p12
 ```
 
 ## Visual Signature Appearance
 
-The visible signature stamp should render:
-- Signature text in a cursive/script style (using a signature font, e.g. `GreatVibes-Regular.ttf` or similar free font)
-- Name: "PDF Signer"
-- Date: automatically appended (e.g. "16 March 2026")
+The visible signature stamp renders:
+- Signer name in a script/cursive style (using `GreatVibes-Regular.ttf` or similar free font bundled in `assets/`)
+- Date automatically appended (e.g. "16 March 2026")
 - Small "Digitally signed" label in grey beneath
-- No border box — clean, natural appearance
-- Approximate size: 200×50 points
+- Clean appearance, no border box
+- Default size: 200×50 points
 
-If a signature image (`~/~/.pdf-signer/signature.png`) exists, use it instead of the text rendering.
+If a signature image is provided via `PDF_SIGNER_IMAGE` env var or `--signature-image` flag, use it instead of text rendering.
 
-## Environment / Config
+## Environment Variables
 
-Credentials and paths read from environment or defaults:
-- `RICHARD_CERT_PATH` — override cert path (default: `~/~/.pdf-signer/signer.p12`)
-- `RICHARD_CERT_PASS` — override cert passphrase (default: read from `.cert-pass` file)
-- `ANTHROPIC_API_KEY` — required for vision detection fallback
+| Variable | Description | Default |
+|---|---|---|
+| `PDF_SIGNER_CERT_PATH` | Path to .p12 cert | `~/.pdf-signer/signer.p12` |
+| `PDF_SIGNER_CERT_PASS` | Cert passphrase | Read from `~/.pdf-signer/.cert-pass` |
+| `PDF_SIGNER_NAME` | Signer display name | From cert CN |
+| `PDF_SIGNER_EMAIL` | Signer email | From cert |
+| `PDF_SIGNER_IMAGE` | Path to signature PNG | None (use text rendering) |
+| `ANTHROPIC_API_KEY` | Required for vision detection | — |
 
-## SKILL.md
+## JSON Output
 
-Write an OpenClaw-compatible SKILL.md that describes:
-- When to use this skill (agent receives a PDF to sign)
-- How to call the script
-- The detection chain (so agents understand what to expect)
-- Example usage
-
-## README.md
-
-Write a clear README covering:
-- Installation (`pip install -r requirements.txt`, poppler dependency)
-- First-run cert generation
-- Usage examples
-- How the detection chain works
-
-## Output
-
-The script should print a JSON result to stdout:
 ```json
 {
   "success": true,
@@ -139,3 +138,23 @@ On error:
   "detection_method": null
 }
 ```
+
+## SKILL.md
+
+Write an OpenClaw-compatible SKILL.md that describes:
+- What the skill does (sign PDFs on behalf of a configured signer)
+- Setup (run `gen_cert.py` once, set env vars)
+- How to call `sign.py`
+- The detection chain
+- Example usage
+
+## README.md
+
+Write a clear README covering:
+- What it does
+- Installation (`pip install -r requirements.txt`, poppler dependency note)
+- First-run setup (`python3 scripts/gen_cert.py`)
+- Configuration (env vars table)
+- Usage examples
+- How the detection chain works
+- Contributing / licence (MIT)
