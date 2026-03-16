@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Main PDF signing script — entry point for the pdf-signer skill."""
+"""Main PDF signing script — entry point for the pdf-signer tool."""
 
 import argparse
 import json
@@ -12,6 +12,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 sys.path.insert(0, str(SCRIPT_DIR))
+
+ASSETS_DIR = SCRIPT_DIR.parent / "assets"
 
 
 def get_page_count(pdf_path):
@@ -62,27 +64,48 @@ def load_signer(cert_path, passphrase):
     )
 
 
-def build_stamp_style():
+def get_signer_name(cert_path, passphrase, name_override=None):
+    """Resolve the signer display name."""
+    if name_override:
+        return name_override
+    env_name = os.environ.get("PDF_SIGNER_NAME")
+    if env_name:
+        return env_name
+    # Read from cert CN
+    from gen_cert import get_cert_cn
+    cn = get_cert_cn(cert_path, passphrase)
+    return cn or "Signer"
+
+
+def build_stamp_style(signer_name, signature_image=None):
     """Build the visible signature stamp style."""
     from pyhanko.stamp import TextStampStyle
 
-    sig_img = Path.home() / ".openclaw" / "workspace" / ".certs" / "signature.png"
+    sig_img = signature_image or os.environ.get("PDF_SIGNER_IMAGE")
+
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%-d %B %Y")
 
-    if sig_img.exists():
+    # Check for bundled cursive font
+    font_path = ASSETS_DIR / "GreatVibes-Regular.ttf"
+
+    if sig_img and Path(sig_img).exists():
         return TextStampStyle(
-            stamp_text="Digitally signed\n%(ts)s",
+            stamp_text=f"Digitally signed\n{date_str}",
             background=str(sig_img),
             background_opacity=1.0,
         )
-    return TextStampStyle(
-        stamp_text=f"PDF Signer\n{date_str}\nDigitally signed",
-    )
+
+    style_kwargs = {
+        "stamp_text": f"{signer_name}\n{date_str}\nDigitally signed",
+    }
+
+    return TextStampStyle(**style_kwargs)
 
 
 def sign_pdf(input_path, output_path, page=None, x=None, y=None,
-             width=200, height=50, invisible=False, position=None):
+             width=200, height=50, invisible=False, position=None,
+             name=None, email=None, cert=None, signature_image=None):
     """Sign a PDF document. Returns a result dict."""
     from gen_cert import ensure_cert
     from pyhanko.sign import signers, fields as sig_fields
@@ -95,8 +118,9 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
     if not input_path.exists():
         return {"success": False, "error": f"Input file not found: {input_path}", "detection_method": None}
 
-    cert_path, passphrase = ensure_cert()
+    cert_path, passphrase = ensure_cert(cert_path=cert, name=name, email=email)
     signer = load_signer(cert_path, passphrase)
+    signer_name = get_signer_name(cert_path, passphrase, name_override=name)
     detection_method = None
     field_name = None
 
@@ -170,7 +194,7 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
                     ),
                 )
                 meta = signers.PdfSignatureMetadata(field_name=sig_field_name)
-                stamp_style = build_stamp_style()
+                stamp_style = build_stamp_style(signer_name, signature_image)
                 pdf_signer = PdfSigner(meta, signer, stamp_style=stamp_style)
 
             with open(output_path, "wb") as outf:
@@ -200,6 +224,10 @@ def main():
     parser.add_argument("--position", choices=["last-page-bottom-right", "last-page-bottom-left"],
                         help="Named position shortcut")
     parser.add_argument("--invisible", action="store_true", help="Invisible signature (cryptographic only)")
+    parser.add_argument("--name", help="Signer display name (overrides PDF_SIGNER_NAME / cert CN)")
+    parser.add_argument("--email", help="Signer email (used in cert generation)")
+    parser.add_argument("--cert", help="Path to PKCS#12 certificate file")
+    parser.add_argument("--signature-image", help="Path to signature PNG image")
 
     args = parser.parse_args()
 
@@ -213,6 +241,10 @@ def main():
         height=args.height,
         invisible=args.invisible,
         position=args.position,
+        name=args.name,
+        email=args.email,
+        cert=args.cert,
+        signature_image=args.signature_image,
     )
 
     print(json.dumps(result, indent=2))
