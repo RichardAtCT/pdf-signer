@@ -154,11 +154,13 @@ def build_initials_stamp_style(initials_text, initials_image=None):
     return TextStampStyle(**style_kwargs)
 
 
-def _find_initials_positions(pdf_path, total_pages):
+def _find_initials_positions(pdf_path, total_pages, excluded_zones=None):
     """Find clear whitespace positions for initials on each page using pdfminer.
 
-    Preferred order: bottom-right → bottom-left → top-right → top-left.
+    Preferred order: bottom-right → bottom-left → top-right → top-left → inner margins.
     Falls back to bottom-left x=20, y=20 if scanning fails.
+
+    excluded_zones: list of {page, x, y} dicts (e.g. signer 1's positions) to treat as occupied.
     """
     try:
         from pdfminer.high_level import extract_pages
@@ -168,6 +170,13 @@ def _find_initials_positions(pdf_path, total_pages):
 
     ini_w, ini_h = 80, 30
     margin = 10  # padding from page edge
+
+    # Build a lookup of excluded rectangles per page
+    excl_by_page = {}
+    for zone in (excluded_zones or []):
+        pg = zone["page"]
+        excl_by_page.setdefault(pg, []).append((zone["x"], zone["y"], zone["x"] + ini_w, zone["y"] + ini_h))
+
     results = []
 
     try:
@@ -180,8 +189,8 @@ def _find_initials_positions(pdf_path, total_pages):
             page_layout = page_layouts[page_num - 1]
             pw, ph = page_layout.width, page_layout.height
 
-            # Collect all content bounding boxes
-            content_boxes = []
+            # Collect all content bounding boxes + excluded zones for this page
+            content_boxes = list(excl_by_page.get(page_num, []))
             for element in page_layout:
                 if isinstance(element, (LTTextBox, LTTextLine, LTFigure, LTImage)):
                     content_boxes.append(element.bbox)  # (x0, y0, x1, y1)
@@ -189,17 +198,18 @@ def _find_initials_positions(pdf_path, total_pages):
             def _is_clear(cx, cy):
                 """Check if a rectangle at (cx, cy) with size ini_w x ini_h is clear."""
                 for bx0, by0, bx1, by1 in content_boxes:
-                    # Check overlap
                     if cx < bx1 and cx + ini_w > bx0 and cy < by1 and cy + ini_h > by0:
                         return False
                 return True
 
-            # Candidate positions: bottom-right, bottom-left, top-right, top-left
+            # Candidate positions — more options to handle multiple signers
             candidates = [
-                (pw - ini_w - margin, margin),           # bottom-right
-                (margin, margin),                         # bottom-left
-                (pw - ini_w - margin, ph - ini_h - margin),  # top-right
-                (margin, ph - ini_h - margin),            # top-left
+                (pw - ini_w - margin, margin),                    # bottom-right
+                (margin, margin),                                  # bottom-left
+                (pw / 2 - ini_w / 2, margin),                     # bottom-centre
+                (pw - ini_w - margin, ph - ini_h - margin),       # top-right
+                (margin, ph - ini_h - margin),                    # top-left
+                (pw / 2 - ini_w / 2, ph - ini_h - margin),       # top-centre
             ]
 
             placed = False
@@ -210,7 +220,6 @@ def _find_initials_positions(pdf_path, total_pages):
                     break
 
             if not placed:
-                # Fallback: bottom-left
                 results.append({"page": page_num, "x": 20, "y": 20})
         else:
             results.append({"page": page_num, "x": 20, "y": 20})
@@ -276,7 +285,7 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
              name=None, email=None, cert=None, signature_image=None,
              initials=False, initials_all_pages=False,
              initials_text=None, initials_image=None,
-             sign_pages=None, signer_index=1):
+             sign_pages=None, sign_at=None, signer_index=1):
     """Sign a PDF document. Returns a result dict."""
     from gen_cert import ensure_cert
     from pyhanko.sign import signers, fields as sig_fields
@@ -299,7 +308,14 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
     # Determine initials locations
     if initials_all_pages:
         total_pages = get_page_count(str(input_path))
-        initials_placed = _find_initials_positions(str(input_path), total_pages)
+        # For signer 2+, derive signer 1's positions from the original PDF and exclude them
+        excluded_zones = None
+        if signer_index > 1:
+            # Re-run position finding on the same page layout to find where signer 1 placed initials
+            # (use the input PDF which already has signer 1's stamps baked in as content boxes)
+            signer1_positions = _find_initials_positions(str(input_path), total_pages)
+            excluded_zones = signer1_positions
+        initials_placed = _find_initials_positions(str(input_path), total_pages, excluded_zones=excluded_zones)
     elif initials:
         # Detect initials locations or use signature detection location with initials size
         from detect_fields import detect_initials_locations
@@ -314,8 +330,30 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
     if sign_pages:
         # Resolve signature placements for each requested page, checking for multiple locations
         from detect_fields import detect_all_signature_locations_on_page
+        sign_at = sign_at or {}
         sig_placements = []
         for pg in sign_pages:
+            # Check --sign-at PAGE:X:Y overrides first
+            if pg in sign_at:
+                sx, sy = sign_at[pg]
+                sig_placements.append({
+                    "page": pg, "x": sx, "y": sy,
+                    "width": width, "height": height,
+                    "detection_method": "explicit", "field_name": None,
+                })
+                continue
+            # Legacy: --page/--x/--y for single-page override
+            if x is not None and y is not None and (page is None or page == pg):
+                sig_placements.append({
+                    "page": pg,
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                    "detection_method": "explicit",
+                    "field_name": None,
+                })
+                continue
             all_locations = detect_all_signature_locations_on_page(str(input_path), pg)
             if len(all_locations) > 1:
                 # Multiple signature locations found — need clarification
@@ -622,6 +660,8 @@ def main():
     parser.add_argument("--initials-image", help="Path to initials PNG image")
     parser.add_argument("--sign-pages", type=str, default=None,
                         help="Comma-separated page numbers for full signature placement (1-based)")
+    parser.add_argument("--sign-at", type=str, action="append", dest="sign_at", metavar="PAGE:X:Y",
+                        help="Explicit placement for a specific sign-page, e.g. --sign-at 9:324:657 (repeatable)")
     parser.add_argument("--signer-index", type=int, default=1,
                         help="Signer index (default: 1). Use 2+ for chained multi-signer signing to avoid field name collisions")
 
@@ -634,6 +674,17 @@ def main():
             sign_pages = [int(p.strip()) for p in args.sign_pages.split(",")]
         except ValueError:
             print(json.dumps({"success": False, "error": "--sign-pages must be comma-separated integers"}))
+            sys.exit(1)
+
+    # Parse --sign-at PAGE:X:Y into a dict keyed by page number
+    sign_at = {}
+    for entry in (args.sign_at or []):
+        try:
+            parts = entry.split(":")
+            pg, sx, sy = int(parts[0]), float(parts[1]), float(parts[2])
+            sign_at[pg] = (sx, sy)
+        except (ValueError, IndexError):
+            print(json.dumps({"success": False, "error": f"--sign-at must be PAGE:X:Y, got: {entry}"}))
             sys.exit(1)
 
     result = sign_pdf(
@@ -655,6 +706,7 @@ def main():
         initials_text=args.initials_text,
         initials_image=args.initials_image,
         sign_pages=sign_pages,
+        sign_at=sign_at,
         signer_index=args.signer_index,
     )
 

@@ -8,6 +8,7 @@ A general-purpose command-line tool and OpenClaw agent skill for signing PDF doc
 - **Configurable signer** — identity set via environment variables or CLI flags
 - **Visible stamp** — renders signer name + date on the document
 - **JSON output** — machine-readable results for agent integration
+- **Initials stamps** — place initials on specific pages or all pages
 - **Invisible signing** — cryptographic-only option (no visual stamp)
 
 ## Installation
@@ -47,6 +48,8 @@ This creates:
 | `PDF_SIGNER_NAME` | Signer display name | From cert CN |
 | `PDF_SIGNER_EMAIL` | Signer email (used at cert generation) | — |
 | `PDF_SIGNER_IMAGE` | Path to signature PNG image | None (uses text rendering) |
+| `PDF_SIGNER_INITIALS` | Custom initials text (e.g. "RA") | Auto-derived from name |
+| `PDF_SIGNER_INITIALS_IMAGE` | Path to initials PNG image | None (uses text rendering) |
 | `ANTHROPIC_API_KEY` | Required for vision detection fallback | — |
 
 ## Usage
@@ -73,6 +76,18 @@ python3 scripts/sign.py input.pdf signed.pdf --cert /path/to/signer.p12
 
 # Use a signature image instead of text rendering
 python3 scripts/sign.py input.pdf signed.pdf --signature-image /path/to/sig.png
+
+# Place initials at detected location instead of full signature
+python3 scripts/sign.py input.pdf signed.pdf --initials
+
+# Place initials on every page at bottom-left, then sign
+python3 scripts/sign.py input.pdf signed.pdf --initials-all-pages
+
+# Custom initials text
+python3 scripts/sign.py input.pdf signed.pdf --initials --initials-text "RA"
+
+# Custom initials image
+python3 scripts/sign.py input.pdf signed.pdf --initials --initials-image /path/to/initials.png
 ```
 
 ## Detection Chain
@@ -102,7 +117,11 @@ JSON is printed to stdout:
   "output": "/path/to/signed.pdf",
   "detection_method": "pyhanko_field | text_placeholder | vision | manual",
   "signature_page": 1,
-  "signature_location": {"x": 400.0, "y": 100.0}
+  "signature_location": {"x": 400.0, "y": 100.0},
+  "initials_placed": [
+    {"page": 1, "x": 20.0, "y": 20.0},
+    {"page": 2, "x": 20.0, "y": 20.0}
+  ]
 }
 ```
 
