@@ -264,12 +264,19 @@ def _detect_signature_for_page(pdf_path, page_num):
     }
 
 
+def _apply_signer_suffix(field_name, signer_index):
+    """Append _s{N} suffix to a field name when signer_index > 1."""
+    if signer_index and signer_index > 1:
+        return f"{field_name}_s{signer_index}"
+    return field_name
+
+
 def sign_pdf(input_path, output_path, page=None, x=None, y=None,
              width=200, height=50, invisible=False, position=None,
              name=None, email=None, cert=None, signature_image=None,
              initials=False, initials_all_pages=False,
              initials_text=None, initials_image=None,
-             sign_pages=None):
+             sign_pages=None, signer_index=1):
     """Sign a PDF document. Returns a result dict."""
     from gen_cert import ensure_cert
     from pyhanko.sign import signers, fields as sig_fields
@@ -330,6 +337,7 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
                     place_initials_stamps(writer, initials_placed, ini_style)
 
                 sig_field_name = first["field_name"] or "Signature_p%d" % first["page"]
+                sig_field_name = _apply_signer_suffix(sig_field_name, signer_index)
                 page_idx = first["page"] - 1
                 sig_fields.append_signature_field(
                     writer,
@@ -364,6 +372,7 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
                     with open(tmp_path, "rb") as inf:
                         writer = IncrementalPdfFileWriter(inf)
                         sig_field_name = placement["field_name"] or "Signature_p%d" % placement["page"]
+                        sig_field_name = _apply_signer_suffix(sig_field_name, signer_index)
                         page_idx = placement["page"] - 1
                         sig_fields.append_signature_field(
                             writer,
@@ -491,6 +500,7 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
         with open(input_path, "rb") as inf:
             writer = IncrementalPdfFileWriter(inf)
             sig_field_name = field_name or "Signature"
+            sig_field_name = _apply_signer_suffix(sig_field_name, signer_index)
 
             # Place initials stamps before signing (visual-only annotations)
             if initials_placed:
@@ -580,6 +590,8 @@ def main():
     parser.add_argument("--initials-image", help="Path to initials PNG image")
     parser.add_argument("--sign-pages", type=str, default=None,
                         help="Comma-separated page numbers for full signature placement (1-based)")
+    parser.add_argument("--signer-index", type=int, default=1,
+                        help="Signer index (default: 1). Use 2+ for chained multi-signer signing to avoid field name collisions")
 
     args = parser.parse_args()
 
@@ -611,6 +623,7 @@ def main():
         initials_text=args.initials_text,
         initials_image=args.initials_image,
         sign_pages=sign_pages,
+        signer_index=args.signer_index,
     )
 
     print(json.dumps(result, indent=2))

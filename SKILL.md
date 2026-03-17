@@ -51,6 +51,20 @@ python3 scripts/sign.py input.pdf output.pdf --cert /path/to/signer.p12
 
 # Use a signature image
 python3 scripts/sign.py input.pdf output.pdf --signature-image /path/to/signature.png
+
+# Place initials at detected location instead of full signature
+python3 scripts/sign.py input.pdf output.pdf --initials
+
+# Place initials on every page, then sign
+python3 scripts/sign.py input.pdf output.pdf --initials-all-pages
+
+# Custom initials text or image
+python3 scripts/sign.py input.pdf output.pdf --initials --initials-text "RA"
+python3 scripts/sign.py input.pdf output.pdf --initials --initials-image /path/to/initials.png
+
+# Two signers: chain the passes
+PDF_SIGNER_NAME="Richard Atkinson" python3 scripts/sign.py input.pdf /tmp/pass1.pdf --initials-all-pages --sign-pages 9,11
+PDF_SIGNER_NAME="Kim Goetsch" python3 scripts/sign.py /tmp/pass1.pdf output.pdf --initials-all-pages --sign-pages 9,11 --signer-index 2
 ```
 
 ## Output
@@ -63,7 +77,11 @@ The script prints a JSON object to stdout:
   "output": "/path/to/signed.pdf",
   "detection_method": "pyhanko_field",
   "signature_page": 1,
-  "signature_location": {"x": 400, "y": 100}
+  "signature_location": {"x": 400, "y": 100},
+  "initials_placed": [
+    {"page": 1, "x": 20, "y": 20},
+    {"page": 2, "x": 20, "y": 20}
+  ]
 }
 ```
 
@@ -85,6 +103,8 @@ On error:
 | `PDF_SIGNER_NAME` | Signer display name | From cert CN |
 | `PDF_SIGNER_EMAIL` | Signer email | From cert |
 | `PDF_SIGNER_IMAGE` | Path to signature PNG | None (use text rendering) |
+| `PDF_SIGNER_INITIALS` | Custom initials text | Auto-derived from name |
+| `PDF_SIGNER_INITIALS_IMAGE` | Path to initials PNG | None (use text rendering) |
 | `ANTHROPIC_API_KEY` | Required for vision detection fallback | — |
 
 ## Notes
