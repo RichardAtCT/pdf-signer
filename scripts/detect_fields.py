@@ -478,6 +478,118 @@ def _collect_text_candidates_on_page(pdf_path, target_page):
     return candidates
 
 
+# Label patterns that identify distinct signers near underscore lines
+_LABEL_RE = re.compile(
+    r"^(PURCHASER\s*\d*|SELLER\s*\d*|WITNESS\s*\d*|SIGNER\s*\d*)$",
+    re.IGNORECASE,
+)
+
+
+def _detect_labeled_signature_blocks(pdf_path, target_page):
+    """Scan a page for underscore lines with signer labels below them.
+
+    Pattern: an underscore line (5+ underscores) with a label like
+    "PURCHASER 1" within 60pts below it.  Also handles "SIGNED:" as
+    an anchor — looks for an underscore within 60pts below that text.
+
+    Returns a list of location dicts.
+    """
+    try:
+        from pdfminer.high_level import extract_pages
+        from pdfminer.layout import LTTextBox, LTTextLine, LAParams
+    except ImportError:
+        return []
+
+    underscore_re = re.compile(r"_{5,}")
+    signed_re = re.compile(r"SIGNED\s*:", re.IGNORECASE)
+
+    underscores = []  # (x, y, bbox)
+    labels = []       # (x, y, text)
+    signed_anchors = []  # (x, y)
+
+    try:
+        for page_num, page_layout in enumerate(
+            extract_pages(str(pdf_path), laparams=LAParams()), 1
+        ):
+            if page_num != target_page:
+                continue
+            for element in page_layout:
+                if not isinstance(element, (LTTextBox, LTTextLine)):
+                    continue
+                text = element.get_text().strip()
+                bbox = element.bbox  # (x0, y0, x1, y1) — y0 is bottom
+
+                if underscore_re.search(text):
+                    underscores.append((bbox[0], bbox[1], bbox))
+
+                if signed_re.search(text):
+                    signed_anchors.append((bbox[0], bbox[1]))
+
+                # Check each line inside text boxes for labels
+                if isinstance(element, LTTextBox):
+                    for line in element:
+                        if isinstance(line, LTTextLine):
+                            line_text = line.get_text().strip()
+                            if _LABEL_RE.match(line_text):
+                                labels.append((line.bbox[0], line.bbox[1], line_text))
+                else:
+                    if _LABEL_RE.match(text):
+                        labels.append((bbox[0], bbox[1], text))
+    except Exception as e:
+        print(f"Warning: Label-based signature detection failed: {e}", file=sys.stderr)
+        return []
+
+    if not underscores:
+        return []
+
+    results = []
+    used_underscores = set()
+
+    # Match labels to underscore lines above them (label.y is below underscore.y
+    # in PDF coords, meaning label.y < underscore.y, within 60pts)
+    for lx, ly, label_text in labels:
+        best_ul = None
+        best_dist = 61
+        for i, (ux, uy, ubbox) in enumerate(underscores):
+            # Label should be below the underscore: label y < underscore y
+            dist = uy - ly
+            if 0 < dist < 60 and dist < best_dist:
+                best_dist = dist
+                best_ul = i
+        if best_ul is not None:
+            ux, uy, ubbox = underscores[best_ul]
+            used_underscores.add(best_ul)
+            results.append({
+                "method": "text_label_scan",
+                "label": label_text,
+                "page": target_page,
+                "x": lx,
+                "y": uy,
+                "width": min(200, ubbox[2] - ubbox[0]),
+                "height": 50,
+            })
+
+    # Handle "SIGNED:" anchor — if no labels matched, find underscore below SIGNED:
+    if not results and signed_anchors:
+        for sx, sy in signed_anchors:
+            for i, (ux, uy, ubbox) in enumerate(underscores):
+                # Underscore below SIGNED: means underscore.y < signed.y
+                dist = sy - uy
+                if 0 < dist < 60 and i not in used_underscores:
+                    used_underscores.add(i)
+                    results.append({
+                        "method": "text_label_scan",
+                        "label": "SIGNED",
+                        "page": target_page,
+                        "x": ux,
+                        "y": uy,
+                        "width": min(200, ubbox[2] - ubbox[0]),
+                        "height": 50,
+                    })
+
+    return results
+
+
 def detect_all_signature_locations_on_page(pdf_path, target_page):
     """Detect ALL signature locations on a specific page.
 
@@ -490,6 +602,11 @@ def detect_all_signature_locations_on_page(pdf_path, target_page):
     text_candidates = _collect_text_candidates_on_page(pdf_path, target_page)
     if text_candidates:
         return text_candidates
+
+    # Try label-based detection: underscore lines + signer labels below them
+    label_candidates = _detect_labeled_signature_blocks(pdf_path, target_page)
+    if label_candidates:
+        return label_candidates
 
     # Vision fallback — detect all signature locations
     try:
