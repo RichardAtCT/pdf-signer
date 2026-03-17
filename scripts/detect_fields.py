@@ -10,16 +10,31 @@ import re
 import sys
 from pathlib import Path
 
-# Text placeholder patterns (case-insensitive)
-PLACEHOLDER_PATTERNS = [
+# High-priority signature placeholder patterns (case-insensitive)
+SIGN_PATTERNS = [
     r"/s/",
     r"\[SIGNATURE\]",
     r"\[SIGN\s+HERE\]",
     r"\{\{signature\}\}",
     r"\{signature\}",
-    r"_{5,}",  # 5+ underscores
     r"Signature:\s*$",
+    r"Sign\s+here",
 ]
+
+# Lower-priority name/title field patterns — used as fallback
+NAME_FIELD_PATTERNS = [
+    r"Name:\s*$",
+    r"Purchaser:\s*$",
+    r"Seller:\s*$",
+]
+
+# Underscore lines (ambiguous — lower than explicit sign patterns)
+UNDERSCORE_PATTERNS = [
+    r"_{5,}",  # 5+ underscores
+]
+
+# Combined for backward compat — but detection now uses ranked search
+PLACEHOLDER_PATTERNS = SIGN_PATTERNS + UNDERSCORE_PATTERNS + NAME_FIELD_PATTERNS
 
 # Initials placeholder patterns (case-insensitive)
 INITIALS_PATTERNS = [
@@ -97,6 +112,8 @@ def detect_pyhanko_fields(pdf_path):
 def detect_text_placeholders(pdf_path):
     """Stage 2: Scan text layer for signature placeholder patterns.
 
+    Uses ranked detection: explicit sign patterns > underscores > name fields.
+    If both sign and name fields found on the same page, prefers the sign field.
     Returns dict with location info or None.
     """
     try:
@@ -106,35 +123,65 @@ def detect_text_placeholders(pdf_path):
         print("Warning: pdfminer.six not available for text detection.", file=sys.stderr)
         return None
 
-    compiled_patterns = [re.compile(p, re.IGNORECASE) for p in PLACEHOLDER_PATTERNS]
+    sign_compiled = [re.compile(p, re.IGNORECASE) for p in SIGN_PATTERNS]
+    underscore_compiled = [re.compile(p, re.IGNORECASE) for p in UNDERSCORE_PATTERNS]
+    name_compiled = [re.compile(p, re.IGNORECASE) for p in NAME_FIELD_PATTERNS]
+
+    # Collect candidates across all pages with priority tiers
+    # tier 0 = sign patterns (highest), tier 1 = underscores, tier 2 = name fields
+    candidates = []
+
+    def _make_result(element, page_num, page_layout, pattern, tier, method="text_placeholder"):
+        bbox = element.bbox
+        return {
+            "method": method,
+            "pattern_matched": pattern.pattern,
+            "text": element.get_text().strip()[:100],
+            "page": page_num,
+            "x": bbox[0],
+            "y": bbox[1],
+            "width": min(200, bbox[2] - bbox[0]),
+            "height": max(50, bbox[3] - bbox[1]),
+            "page_width": page_layout.width,
+            "page_height": page_layout.height,
+            "_tier": tier,
+        }
 
     try:
         for page_num, page_layout in enumerate(extract_pages(str(pdf_path), laparams=LAParams()), 1):
-            page_width = page_layout.width
-            page_height = page_layout.height
-
             for element in page_layout:
-                if isinstance(element, (LTTextBox, LTTextLine)):
-                    text = element.get_text().strip()
-                    for pattern in compiled_patterns:
+                if not isinstance(element, (LTTextBox, LTTextLine)):
+                    continue
+                text = element.get_text().strip()
+                for pattern in sign_compiled:
+                    if pattern.search(text):
+                        candidates.append(_make_result(element, page_num, page_layout, pattern, 0))
+                        break
+                else:
+                    for pattern in underscore_compiled:
                         if pattern.search(text):
-                            bbox = element.bbox  # (x0, y0, x1, y1) bottom-left origin
-                            return {
-                                "method": "text_placeholder",
-                                "pattern_matched": pattern.pattern,
-                                "text": text[:100],
-                                "page": page_num,
-                                "x": bbox[0],
-                                "y": bbox[1],
-                                "width": min(200, bbox[2] - bbox[0]),
-                                "height": max(50, bbox[3] - bbox[1]),
-                                "page_width": page_width,
-                                "page_height": page_height,
-                            }
+                            candidates.append(_make_result(element, page_num, page_layout, pattern, 1))
+                            break
+                    else:
+                        for pattern in name_compiled:
+                            if pattern.search(text):
+                                candidates.append(_make_result(
+                                    element, page_num, page_layout, pattern, 2,
+                                    method="name_field_fallback",
+                                ))
+                                break
     except Exception as e:
         print(f"Warning: Text placeholder detection failed: {e}", file=sys.stderr)
+        return None
 
-    return None
+    if not candidates:
+        return None
+
+    # Pick best candidate: lowest tier wins; within same tier, last page then lowest y
+    candidates.sort(key=lambda c: (c["_tier"], -c["page"], c["y"]))
+    best = candidates[0]
+    best.pop("_tier", None)
+    return best
 
 
 def detect_vision(pdf_path):

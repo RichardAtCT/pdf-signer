@@ -90,6 +90,22 @@ def get_initials_text(signer_name, initials_text_override=None):
     return "X"
 
 
+def _make_handwriting_text_box_style():
+    """Create a TextBoxStyle using the bundled GreatVibes cursive font, or None."""
+    font_path = ASSETS_DIR / "GreatVibes-Regular.ttf"
+    if not font_path.exists():
+        return None
+    try:
+        from pyhanko.pdf_utils.font.opentype import GlyphAccumulatorFactory
+        from pyhanko.pdf_utils.text import TextBoxStyle
+
+        font = GlyphAccumulatorFactory(font_file=str(font_path))
+        return TextBoxStyle(font=font)
+    except Exception as e:
+        print(f"Warning: Could not load handwriting font: {e}", file=sys.stderr)
+        return None
+
+
 def build_stamp_style(signer_name, signature_image=None):
     """Build the visible signature stamp style."""
     from pyhanko.stamp import TextStampStyle
@@ -98,9 +114,6 @@ def build_stamp_style(signer_name, signature_image=None):
 
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%-d %B %Y")
-
-    # Check for bundled cursive font
-    font_path = ASSETS_DIR / "GreatVibes-Regular.ttf"
 
     if sig_img and Path(sig_img).exists():
         return TextStampStyle(
@@ -112,6 +125,10 @@ def build_stamp_style(signer_name, signature_image=None):
     style_kwargs = {
         "stamp_text": f"{signer_name}\n{date_str}\nDigitally signed",
     }
+
+    text_box_style = _make_handwriting_text_box_style()
+    if text_box_style:
+        style_kwargs["text_box_style"] = text_box_style
 
     return TextStampStyle(**style_kwargs)
 
@@ -129,7 +146,76 @@ def build_initials_stamp_style(initials_text, initials_image=None):
             background_opacity=1.0,
         )
 
-    return TextStampStyle(stamp_text=initials_text)
+    style_kwargs = {"stamp_text": initials_text}
+    text_box_style = _make_handwriting_text_box_style()
+    if text_box_style:
+        style_kwargs["text_box_style"] = text_box_style
+
+    return TextStampStyle(**style_kwargs)
+
+
+def _find_initials_positions(pdf_path, total_pages):
+    """Find clear whitespace positions for initials on each page using pdfminer.
+
+    Preferred order: bottom-right → bottom-left → top-right → top-left.
+    Falls back to bottom-left x=20, y=20 if scanning fails.
+    """
+    try:
+        from pdfminer.high_level import extract_pages
+        from pdfminer.layout import LTTextBox, LTTextLine, LTFigure, LTImage, LAParams
+    except ImportError:
+        return [{"page": p, "x": 20, "y": 20} for p in range(1, total_pages + 1)]
+
+    ini_w, ini_h = 80, 30
+    margin = 10  # padding from page edge
+    results = []
+
+    try:
+        page_layouts = list(extract_pages(str(pdf_path), laparams=LAParams()))
+    except Exception:
+        return [{"page": p, "x": 20, "y": 20} for p in range(1, total_pages + 1)]
+
+    for page_num in range(1, total_pages + 1):
+        if page_num - 1 < len(page_layouts):
+            page_layout = page_layouts[page_num - 1]
+            pw, ph = page_layout.width, page_layout.height
+
+            # Collect all content bounding boxes
+            content_boxes = []
+            for element in page_layout:
+                if isinstance(element, (LTTextBox, LTTextLine, LTFigure, LTImage)):
+                    content_boxes.append(element.bbox)  # (x0, y0, x1, y1)
+
+            def _is_clear(cx, cy):
+                """Check if a rectangle at (cx, cy) with size ini_w x ini_h is clear."""
+                for bx0, by0, bx1, by1 in content_boxes:
+                    # Check overlap
+                    if cx < bx1 and cx + ini_w > bx0 and cy < by1 and cy + ini_h > by0:
+                        return False
+                return True
+
+            # Candidate positions: bottom-right, bottom-left, top-right, top-left
+            candidates = [
+                (pw - ini_w - margin, margin),           # bottom-right
+                (margin, margin),                         # bottom-left
+                (pw - ini_w - margin, ph - ini_h - margin),  # top-right
+                (margin, ph - ini_h - margin),            # top-left
+            ]
+
+            placed = False
+            for cx, cy in candidates:
+                if _is_clear(cx, cy):
+                    results.append({"page": page_num, "x": round(cx, 1), "y": round(cy, 1)})
+                    placed = True
+                    break
+
+            if not placed:
+                # Fallback: bottom-left
+                results.append({"page": page_num, "x": 20, "y": 20})
+        else:
+            results.append({"page": page_num, "x": 20, "y": 20})
+
+    return results
 
 
 def place_initials_stamps(writer, initials_locations, initials_style):
@@ -179,7 +265,7 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
     # Determine initials locations
     if initials_all_pages:
         total_pages = get_page_count(str(input_path))
-        initials_placed = [{"page": p, "x": 20, "y": 20} for p in range(1, total_pages + 1)]
+        initials_placed = _find_initials_positions(str(input_path), total_pages)
     elif initials:
         # Detect initials locations or use signature detection location with initials size
         from detect_fields import detect_initials_locations
