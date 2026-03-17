@@ -8,9 +8,10 @@ import base64
 from pathlib import Path
 
 
-def detect_signature_vision(pdf_path, dpi=150):
+def detect_signature_vision(pdf_path, dpi=150, target_page=None):
     """Render PDF pages as images and use Claude vision to find signature locations.
 
+    If target_page is provided (1-based), only renders and checks that specific page.
     Returns a dict with detection results or None if nothing found.
     """
     try:
@@ -34,12 +35,21 @@ def detect_signature_vision(pdf_path, dpi=150):
     client = anthropic.Anthropic(api_key=api_key)
 
     try:
-        images = convert_from_path(str(pdf_path), dpi=dpi, fmt="png")
+        if target_page is not None:
+            images = convert_from_path(
+                str(pdf_path), dpi=dpi, fmt="png",
+                first_page=target_page, last_page=target_page,
+            )
+            # Re-map so enumeration starts at the target page number
+            pages_and_images = [(target_page, images[0])] if images else []
+        else:
+            images = convert_from_path(str(pdf_path), dpi=dpi, fmt="png")
+            pages_and_images = list(enumerate(images, 1))
     except Exception as e:
         print(f"Warning: Failed to render PDF pages: {e}", file=sys.stderr)
         return None
 
-    for page_num, img in enumerate(images, 1):
+    for page_num, img in pages_and_images:
         import io
         buf = io.BytesIO()
         img.save(buf, format="PNG")

@@ -19,6 +19,14 @@ SIGN_PATTERNS = [
     r"\{signature\}",
     r"Signature:\s*$",
     r"Sign\s+here",
+    r"SIGNATURE\s+PURCHASER",
+    r"SIGNATURE\s+SELLER",
+    r"SIGNATURE\s+OF\s+PURCHASER",
+    r"SIGNATURE\s+OF\s+SELLER",
+    r"SIGNED\s+BY",
+    r"Signature\s+of",
+    r"PURCHASER.{0,20}SIGNATURE",
+    r"x\s*_{5,}",
 ]
 
 # Lower-priority name/title field patterns — used as fallback
@@ -109,11 +117,12 @@ def detect_pyhanko_fields(pdf_path):
     return None
 
 
-def detect_text_placeholders(pdf_path):
+def detect_text_placeholders(pdf_path, target_page=None):
     """Stage 2: Scan text layer for signature placeholder patterns.
 
     Uses ranked detection: explicit sign patterns > underscores > name fields.
     If both sign and name fields found on the same page, prefers the sign field.
+    If target_page is provided, only considers candidates on that page.
     Returns dict with location info or None.
     """
     try:
@@ -174,6 +183,9 @@ def detect_text_placeholders(pdf_path):
         print(f"Warning: Text placeholder detection failed: {e}", file=sys.stderr)
         return None
 
+    if target_page is not None:
+        candidates = [c for c in candidates if c["page"] == target_page]
+
     if not candidates:
         return None
 
@@ -184,9 +196,10 @@ def detect_text_placeholders(pdf_path):
     return best
 
 
-def detect_vision(pdf_path):
+def detect_vision(pdf_path, target_page=None):
     """Stage 3: Use vision model to find signature location.
 
+    If target_page is provided, only renders/checks that specific page.
     Returns dict with location info or None.
     """
     try:
@@ -199,7 +212,7 @@ def detect_vision(pdf_path):
             print("Warning: vision_detect module not available.", file=sys.stderr)
             return None
 
-    result = detect_signature_vision(pdf_path)
+    result = detect_signature_vision(pdf_path, target_page=target_page)
     if result and result.get("found"):
         # We need page dimensions to convert percentages to points
         try:
@@ -397,7 +410,12 @@ def detect_signature_on_page(pdf_path, target_page):
         return result
 
     # Check text placeholders on the specific page
-    result = detect_text_placeholders(pdf_path)
+    result = detect_text_placeholders(pdf_path, target_page=target_page)
+    if result:
+        return result
+
+    # Vision fallback — only render the target page
+    result = detect_vision(pdf_path, target_page=target_page)
     if result and result.get("page") == target_page:
         return result
 
