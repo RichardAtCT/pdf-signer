@@ -77,6 +77,19 @@ def get_signer_name(cert_path, passphrase, name_override=None):
     return cn or "Signer"
 
 
+def get_initials_text(signer_name, initials_text_override=None):
+    """Derive initials from signer name or overrides."""
+    if initials_text_override:
+        return initials_text_override
+    env_initials = os.environ.get("PDF_SIGNER_INITIALS")
+    if env_initials:
+        return env_initials
+    # Auto-derive: first letter of each word
+    if signer_name:
+        return "".join(word[0].upper() for word in signer_name.split() if word)
+    return "X"
+
+
 def build_stamp_style(signer_name, signature_image=None):
     """Build the visible signature stamp style."""
     from pyhanko.stamp import TextStampStyle
@@ -103,9 +116,47 @@ def build_stamp_style(signer_name, signature_image=None):
     return TextStampStyle(**style_kwargs)
 
 
+def build_initials_stamp_style(initials_text, initials_image=None):
+    """Build the visible initials stamp style — smaller, no date/label."""
+    from pyhanko.stamp import TextStampStyle
+
+    ini_img = initials_image or os.environ.get("PDF_SIGNER_INITIALS_IMAGE")
+
+    if ini_img and Path(ini_img).exists():
+        return TextStampStyle(
+            stamp_text="",
+            background=str(ini_img),
+            background_opacity=1.0,
+        )
+
+    return TextStampStyle(stamp_text=initials_text)
+
+
+def place_initials_stamps(writer, initials_locations, initials_style):
+    """Place initials annotation stamps on the PDF (non-signing visual stamps).
+
+    Uses pyhanko's TextStamp to add visual-only stamps for initials.
+    """
+    from pyhanko.stamp import TextStamp
+    from pyhanko.pdf_utils.layout import BoxConstraints
+
+    for loc in initials_locations:
+        page_idx = loc["page"] - 1
+        w = loc.get("width", 80)
+        h = loc.get("height", 30)
+        stamp = TextStamp(
+            writer=writer,
+            style=initials_style,
+            box=BoxConstraints(width=w, height=h),
+        )
+        stamp.apply(dest_page=page_idx, x=loc["x"], y=loc["y"])
+
+
 def sign_pdf(input_path, output_path, page=None, x=None, y=None,
              width=200, height=50, invisible=False, position=None,
-             name=None, email=None, cert=None, signature_image=None):
+             name=None, email=None, cert=None, signature_image=None,
+             initials=False, initials_all_pages=False,
+             initials_text=None, initials_image=None):
     """Sign a PDF document. Returns a result dict."""
     from gen_cert import ensure_cert
     from pyhanko.sign import signers, fields as sig_fields
@@ -123,30 +174,56 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
     signer_name = get_signer_name(cert_path, passphrase, name_override=name)
     detection_method = None
     field_name = None
+    initials_placed = []
 
-    # Auto-detection chain
+    # Determine initials locations
+    if initials_all_pages:
+        total_pages = get_page_count(str(input_path))
+        initials_placed = [{"page": p, "x": 20, "y": 20} for p in range(1, total_pages + 1)]
+    elif initials:
+        # Detect initials locations or use signature detection location with initials size
+        from detect_fields import detect_initials_locations
+        detected = detect_initials_locations(input_path)
+        if detected:
+            initials_placed = detected
+
+    # Use initials mode: place initials at detected/specified location instead of full signature
+    use_initials_as_signature = initials and not initials_all_pages
+
+    # Auto-detection chain for signature
     if page is None and x is None and y is None and position is None and not invisible:
-        from detect_fields import detect_signature_location
-        detection = detect_signature_location(input_path)
+        if use_initials_as_signature and initials_placed:
+            # Use first initials location as the stamp location
+            det = initials_placed[0]
+            page = det["page"]
+            x = det["x"]
+            y = det["y"]
+            width = det.get("width", 80)
+            height = det.get("height", 30)
+            detection_method = "text_placeholder"
+        else:
+            from detect_fields import detect_signature_location
+            detection = detect_signature_location(input_path)
 
-        if detection is None:
-            return {
-                "success": False,
-                "error": (
-                    "No signature location detected. Re-run with explicit placement:\n"
-                    f"  sign.py {input_path} {output_path} --page 1 --x 400 --y 100\n"
-                    f"  sign.py {input_path} {output_path} --position last-page-bottom-right"
-                ),
-                "detection_method": None,
-            }
+            if detection is None and not (initials_all_pages or invisible):
+                return {
+                    "success": False,
+                    "error": (
+                        "No signature location detected. Re-run with explicit placement:\n"
+                        f"  sign.py {input_path} {output_path} --page 1 --x 400 --y 100\n"
+                        f"  sign.py {input_path} {output_path} --position last-page-bottom-right"
+                    ),
+                    "detection_method": None,
+                }
 
-        detection_method = detection["method"]
-        page = detection.get("page", 1)
-        x = detection.get("x", 400)
-        y = detection.get("y", 100)
-        width = detection.get("width", 200)
-        height = detection.get("height", 50)
-        field_name = detection.get("field_name")
+            if detection:
+                detection_method = detection["method"]
+                page = detection.get("page", 1)
+                x = detection.get("x", 400)
+                y = detection.get("y", 100)
+                width = detection.get("width", 200)
+                height = detection.get("height", 50)
+                field_name = detection.get("field_name")
 
     # Resolve named position
     if position:
@@ -172,10 +249,22 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
     if y is None:
         y = 100
 
+    # If --initials flag with no detected locations, use signature location with initials stamp
+    if use_initials_as_signature and not initials_placed:
+        initials_placed = [{"page": page, "x": x, "y": y}]
+        width = 80
+        height = 30
+
     try:
         with open(input_path, "rb") as inf:
             writer = IncrementalPdfFileWriter(inf)
             sig_field_name = field_name or "Signature"
+
+            # Place initials stamps before signing (visual-only annotations)
+            if initials_placed:
+                ini_text = get_initials_text(signer_name, initials_text)
+                ini_style = build_initials_stamp_style(ini_text, initials_image)
+                place_initials_stamps(writer, initials_placed, ini_style)
 
             if invisible:
                 sig_fields.append_signature_field(
@@ -183,6 +272,21 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
                 )
                 meta = signers.PdfSignatureMetadata(field_name=sig_field_name)
                 pdf_signer = PdfSigner(meta, signer)
+            elif use_initials_as_signature:
+                # For --initials mode, the signature field uses initials appearance
+                page_idx = page - 1
+                ini_text = get_initials_text(signer_name, initials_text)
+                ini_style = build_initials_stamp_style(ini_text, initials_image)
+                sig_fields.append_signature_field(
+                    writer,
+                    sig_fields.SigFieldSpec(
+                        sig_field_name=sig_field_name,
+                        on_page=page_idx,
+                        box=(x, y, x + width, y + height),
+                    ),
+                )
+                meta = signers.PdfSignatureMetadata(field_name=sig_field_name)
+                pdf_signer = PdfSigner(meta, signer, stamp_style=ini_style)
             else:
                 page_idx = page - 1
                 sig_fields.append_signature_field(
@@ -203,13 +307,21 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
     except Exception as e:
         return {"success": False, "error": str(e), "detection_method": detection_method}
 
-    return {
+    result = {
         "success": True,
         "output": str(output_path),
         "detection_method": detection_method or "manual",
         "signature_page": page,
         "signature_location": {"x": round(x, 1), "y": round(y, 1)},
     }
+
+    if initials_placed:
+        result["initials_placed"] = [
+            {"page": loc["page"], "x": round(loc["x"], 1), "y": round(loc["y"], 1)}
+            for loc in initials_placed
+        ]
+
+    return result
 
 
 def main():
@@ -228,6 +340,12 @@ def main():
     parser.add_argument("--email", help="Signer email (used in cert generation)")
     parser.add_argument("--cert", help="Path to PKCS#12 certificate file")
     parser.add_argument("--signature-image", help="Path to signature PNG image")
+    parser.add_argument("--initials", action="store_true",
+                        help="Place initials stamp instead of full signature")
+    parser.add_argument("--initials-all-pages", action="store_true",
+                        help="Place initials on every page at bottom-left, then sign")
+    parser.add_argument("--initials-text", help="Custom initials text (e.g. 'RA')")
+    parser.add_argument("--initials-image", help="Path to initials PNG image")
 
     args = parser.parse_args()
 
@@ -245,6 +363,10 @@ def main():
         email=args.email,
         cert=args.cert,
         signature_image=args.signature_image,
+        initials=args.initials,
+        initials_all_pages=args.initials_all_pages,
+        initials_text=args.initials_text,
+        initials_image=args.initials_image,
     )
 
     print(json.dumps(result, indent=2))
