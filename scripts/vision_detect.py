@@ -107,6 +107,97 @@ def detect_signature_vision(pdf_path, dpi=150, target_page=None):
     return None
 
 
+def detect_all_signatures_vision(pdf_path, target_page, dpi=150):
+    """Render a specific PDF page and use Claude vision to find ALL signature locations.
+
+    Returns a list of dicts with x_pct, y_pct, label for each signature location,
+    or an empty list if none found.
+    """
+    try:
+        from pdf2image import convert_from_path
+    except ImportError:
+        return []
+
+    try:
+        import anthropic
+    except ImportError:
+        return []
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return []
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    try:
+        images = convert_from_path(
+            str(pdf_path), dpi=dpi, fmt="png",
+            first_page=target_page, last_page=target_page,
+        )
+        if not images:
+            return []
+    except Exception as e:
+        print(f"Warning: Failed to render PDF page {target_page}: {e}", file=sys.stderr)
+        return []
+
+    import io
+    img = images[0]
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    prompt = (
+        f"This is page {target_page} of a PDF document. "
+        "List ALL signature boxes or lines on this page where a person should sign. "
+        "For each one, provide: a short label (e.g. Purchaser 1, Seller, Witness), "
+        "and the x_pct/y_pct coordinates (0-100, percentage from top-left) of the center of the signature line. "
+        "Return a JSON array of objects: "
+        '[{"label": "...", "x_pct": <0-100>, "y_pct": <0-100>}, ...] '
+        "If no signature locations found, return an empty array []."
+    )
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": img_b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+        )
+    except Exception as e:
+        print(f"Warning: Vision API call failed for page {target_page}: {e}", file=sys.stderr)
+        return []
+
+    response_text = response.content[0].text.strip()
+
+    try:
+        start = response_text.find("[")
+        end = response_text.rfind("]") + 1
+        if start >= 0 and end > start:
+            items = json.loads(response_text[start:end])
+            return [
+                item for item in items
+                if isinstance(item, dict) and "x_pct" in item and "y_pct" in item
+            ]
+    except json.JSONDecodeError:
+        pass
+
+    return []
+
+
 def vision_coords_to_pdf(x_pct, y_pct, page_width, page_height):
     """Convert percentage coordinates from vision model to PDF points.
 

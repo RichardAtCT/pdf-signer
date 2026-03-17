@@ -312,11 +312,43 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
 
     # --- Multi-page signing via --sign-pages ---
     if sign_pages:
-        # Resolve signature placements for each requested page
+        # Resolve signature placements for each requested page, checking for multiple locations
+        from detect_fields import detect_all_signature_locations_on_page
         sig_placements = []
         for pg in sign_pages:
-            info = _detect_signature_for_page(str(input_path), pg)
-            sig_placements.append(info)
+            all_locations = detect_all_signature_locations_on_page(str(input_path), pg)
+            if len(all_locations) > 1:
+                # Multiple signature locations found — need clarification
+                return {
+                    "success": False,
+                    "needs_clarification": True,
+                    "page": pg,
+                    "message": f"Page {pg} has multiple signature locations. Please specify which one (re-run with --page {pg} --x X --y Y).",
+                    "options": [
+                        {"index": i + 1, "label": loc.get("label", f"Location {i + 1}"),
+                         "x": round(loc["x"], 1), "y": round(loc["y"], 1)}
+                        for i, loc in enumerate(all_locations)
+                    ],
+                }
+            elif len(all_locations) == 1:
+                loc = all_locations[0]
+                sig_placements.append({
+                    "page": pg,
+                    "x": loc.get("x", 400),
+                    "y": loc.get("y", 100),
+                    "width": loc.get("width", 200),
+                    "height": loc.get("height", 50),
+                    "detection_method": loc.get("method", "vision"),
+                    "field_name": loc.get("field_name"),
+                })
+            else:
+                # No detection — fall back to default position
+                sig_placements.append(_detect_signature_for_page(str(input_path), pg))
+
+        # Filter out initials on pages that already have a full signature
+        sign_pages_set = set(sign_pages)
+        if initials_placed:
+            initials_placed = [loc for loc in initials_placed if loc["page"] not in sign_pages_set]
 
         # Use tempfiles for incremental signing passes
         import shutil

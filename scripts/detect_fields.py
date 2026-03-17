@@ -422,6 +422,105 @@ def detect_signature_on_page(pdf_path, target_page):
     return None
 
 
+def _get_page_dimensions(pdf_path, page_num):
+    """Get width and height of a PDF page in points."""
+    try:
+        from pyhanko.pdf_utils.reader import PdfFileReader
+        with open(pdf_path, "rb") as f:
+            reader = PdfFileReader(f)
+            page = reader.root["/Pages"]["/Kids"][page_num - 1].get_object()
+            media_box = page.get("/MediaBox") or page.get("/CropBox")
+            if media_box:
+                return float(media_box[2]), float(media_box[3])
+    except Exception:
+        pass
+    return 612, 792
+
+
+def _collect_text_candidates_on_page(pdf_path, target_page):
+    """Collect ALL text-based signature candidates on a specific page.
+
+    Returns a list of candidate dicts (not just the best one).
+    """
+    try:
+        from pdfminer.high_level import extract_pages
+        from pdfminer.layout import LTTextBox, LTTextLine, LAParams
+    except ImportError:
+        return []
+
+    sign_compiled = [re.compile(p, re.IGNORECASE) for p in SIGN_PATTERNS]
+    candidates = []
+
+    try:
+        for page_num, page_layout in enumerate(extract_pages(str(pdf_path), laparams=LAParams()), 1):
+            if page_num != target_page:
+                continue
+            for element in page_layout:
+                if not isinstance(element, (LTTextBox, LTTextLine)):
+                    continue
+                text = element.get_text().strip()
+                for pattern in sign_compiled:
+                    if pattern.search(text):
+                        bbox = element.bbox
+                        candidates.append({
+                            "method": "text_placeholder",
+                            "label": text[:60],
+                            "page": page_num,
+                            "x": bbox[0],
+                            "y": bbox[1],
+                            "width": min(200, bbox[2] - bbox[0]),
+                            "height": max(50, bbox[3] - bbox[1]),
+                        })
+                        break
+    except Exception as e:
+        print(f"Warning: Text scan for all candidates failed: {e}", file=sys.stderr)
+
+    return candidates
+
+
+def detect_all_signature_locations_on_page(pdf_path, target_page):
+    """Detect ALL signature locations on a specific page.
+
+    Uses text placeholder scan first, then vision model.
+    Returns a list of location dicts. Each has: x, y, width, height, label, method.
+    """
+    pdf_path = Path(pdf_path)
+
+    # Try text-based detection first — collect all matches
+    text_candidates = _collect_text_candidates_on_page(pdf_path, target_page)
+    if text_candidates:
+        return text_candidates
+
+    # Vision fallback — detect all signature locations
+    try:
+        from scripts.vision_detect import detect_all_signatures_vision, vision_coords_to_pdf
+    except ImportError:
+        try:
+            from vision_detect import detect_all_signatures_vision, vision_coords_to_pdf
+        except ImportError:
+            return []
+
+    vision_results = detect_all_signatures_vision(str(pdf_path), target_page)
+    if not vision_results:
+        return []
+
+    page_width, page_height = _get_page_dimensions(str(pdf_path), target_page)
+    locations = []
+    for item in vision_results:
+        x, y = vision_coords_to_pdf(item["x_pct"], item["y_pct"], page_width, page_height)
+        locations.append({
+            "method": "vision",
+            "label": item.get("label", "Signature"),
+            "page": target_page,
+            "x": x,
+            "y": y - 25,
+            "width": 200,
+            "height": 50,
+        })
+
+    return locations
+
+
 def detect_signature_location(pdf_path):
     """Run the full detection chain. Returns detection result dict or None."""
     pdf_path = Path(pdf_path)
