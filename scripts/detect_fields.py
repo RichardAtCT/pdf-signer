@@ -383,6 +383,27 @@ def detect_initials_locations(pdf_path):
     return []
 
 
+def detect_signature_on_page(pdf_path, target_page):
+    """Detect a signature field on a specific page number (1-based).
+
+    Checks AcroForm fields and text placeholders limited to the target page.
+    Returns detection result dict or None.
+    """
+    pdf_path = Path(pdf_path)
+
+    # Check AcroForm fields on this page
+    result = detect_pyhanko_fields(pdf_path)
+    if result and result.get("page") == target_page:
+        return result
+
+    # Check text placeholders on the specific page
+    result = detect_text_placeholders(pdf_path)
+    if result and result.get("page") == target_page:
+        return result
+
+    return None
+
+
 def detect_signature_location(pdf_path):
     """Run the full detection chain. Returns detection result dict or None."""
     pdf_path = Path(pdf_path)

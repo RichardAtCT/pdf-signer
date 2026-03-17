@@ -238,11 +238,38 @@ def place_initials_stamps(writer, initials_locations, initials_style):
         stamp.apply(dest_page=page_idx, x=loc["x"], y=loc["y"])
 
 
+def _detect_signature_for_page(pdf_path, page_num):
+    """Detect signature location on a specific page, or return a default."""
+    from detect_fields import detect_signature_on_page
+    detection = detect_signature_on_page(pdf_path, page_num)
+    if detection:
+        return {
+            "page": page_num,
+            "x": detection.get("x", 400),
+            "y": detection.get("y", 100),
+            "width": detection.get("width", 200),
+            "height": detection.get("height", 50),
+            "detection_method": detection["method"],
+            "field_name": detection.get("field_name"),
+        }
+    # Default: bottom-right area
+    return {
+        "page": page_num,
+        "x": 400,
+        "y": 50,
+        "width": 200,
+        "height": 50,
+        "detection_method": "default",
+        "field_name": None,
+    }
+
+
 def sign_pdf(input_path, output_path, page=None, x=None, y=None,
              width=200, height=50, invisible=False, position=None,
              name=None, email=None, cert=None, signature_image=None,
              initials=False, initials_all_pages=False,
-             initials_text=None, initials_image=None):
+             initials_text=None, initials_image=None,
+             sign_pages=None):
     """Sign a PDF document. Returns a result dict."""
     from gen_cert import ensure_cert
     from pyhanko.sign import signers, fields as sig_fields
@@ -275,6 +302,125 @@ def sign_pdf(input_path, output_path, page=None, x=None, y=None,
 
     # Use initials mode: place initials at detected/specified location instead of full signature
     use_initials_as_signature = initials and not initials_all_pages
+
+    # --- Multi-page signing via --sign-pages ---
+    if sign_pages:
+        # Resolve signature placements for each requested page
+        sig_placements = []
+        for pg in sign_pages:
+            info = _detect_signature_for_page(str(input_path), pg)
+            sig_placements.append(info)
+
+        # Use tempfiles for incremental signing passes
+        import shutil
+        import tempfile
+
+        stamp_style = build_stamp_style(signer_name, signature_image)
+
+        # First pass: place initials + first signature
+        first = sig_placements[0]
+        try:
+            with open(input_path, "rb") as inf:
+                writer = IncrementalPdfFileWriter(inf)
+
+                # Place initials stamps before signing
+                if initials_placed:
+                    ini_text = get_initials_text(signer_name, initials_text)
+                    ini_style = build_initials_stamp_style(ini_text, initials_image)
+                    place_initials_stamps(writer, initials_placed, ini_style)
+
+                sig_field_name = first["field_name"] or "Signature_p%d" % first["page"]
+                page_idx = first["page"] - 1
+                sig_fields.append_signature_field(
+                    writer,
+                    sig_fields.SigFieldSpec(
+                        sig_field_name=sig_field_name,
+                        on_page=page_idx,
+                        box=(first["x"], first["y"],
+                             first["x"] + first["width"], first["y"] + first["height"]),
+                    ),
+                )
+                meta = signers.PdfSignatureMetadata(field_name=sig_field_name)
+                pdf_signer = PdfSigner(meta, signer, stamp_style=stamp_style)
+
+                if len(sig_placements) == 1:
+                    # Only one signature — write directly to output
+                    with open(output_path, "wb") as outf:
+                        pdf_signer.sign_pdf(writer, output=outf)
+                else:
+                    # Write to temp file for next pass
+                    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+                    tmp_path = tmp.name
+                    pdf_signer.sign_pdf(writer, output=tmp)
+                    tmp.close()
+
+        except Exception as e:
+            return {"success": False, "error": str(e), "detection_method": None}
+
+        # Subsequent passes for remaining signatures
+        if len(sig_placements) > 1:
+            try:
+                for i, placement in enumerate(sig_placements[1:], 2):
+                    with open(tmp_path, "rb") as inf:
+                        writer = IncrementalPdfFileWriter(inf)
+                        sig_field_name = placement["field_name"] or "Signature_p%d" % placement["page"]
+                        page_idx = placement["page"] - 1
+                        sig_fields.append_signature_field(
+                            writer,
+                            sig_fields.SigFieldSpec(
+                                sig_field_name=sig_field_name,
+                                on_page=page_idx,
+                                box=(placement["x"], placement["y"],
+                                     placement["x"] + placement["width"],
+                                     placement["y"] + placement["height"]),
+                            ),
+                        )
+                        meta = signers.PdfSignatureMetadata(field_name=sig_field_name)
+                        pdf_signer = PdfSigner(meta, signer, stamp_style=stamp_style)
+
+                        is_last = (i == len(sig_placements))
+                        if is_last:
+                            with open(output_path, "wb") as outf:
+                                pdf_signer.sign_pdf(writer, output=outf)
+                        else:
+                            new_tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+                            new_tmp_path = new_tmp.name
+                            pdf_signer.sign_pdf(writer, output=new_tmp)
+                            new_tmp.close()
+                            os.unlink(tmp_path)
+                            tmp_path = new_tmp_path
+
+                # Clean up last temp
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+            except Exception as e:
+                # Clean up temp files
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                return {"success": False, "error": str(e), "detection_method": None}
+
+        result = {
+            "success": True,
+            "output": str(output_path),
+            "signatures_placed": [
+                {
+                    "page": p["page"],
+                    "x": round(p["x"], 1),
+                    "y": round(p["y"], 1),
+                    "detection_method": p["detection_method"],
+                }
+                for p in sig_placements
+            ],
+        }
+        if initials_placed:
+            result["initials_placed"] = [
+                {"page": loc["page"], "x": round(loc["x"], 1), "y": round(loc["y"], 1)}
+                for loc in initials_placed
+            ]
+        return result
+
+    # --- Standard single-signature path (unchanged) ---
 
     # Auto-detection chain for signature
     if page is None and x is None and y is None and position is None and not invisible:
@@ -432,8 +578,19 @@ def main():
                         help="Place initials on every page at bottom-left, then sign")
     parser.add_argument("--initials-text", help="Custom initials text (e.g. 'RA')")
     parser.add_argument("--initials-image", help="Path to initials PNG image")
+    parser.add_argument("--sign-pages", type=str, default=None,
+                        help="Comma-separated page numbers for full signature placement (1-based)")
 
     args = parser.parse_args()
+
+    # Parse --sign-pages into a list of ints
+    sign_pages = None
+    if args.sign_pages:
+        try:
+            sign_pages = [int(p.strip()) for p in args.sign_pages.split(",")]
+        except ValueError:
+            print(json.dumps({"success": False, "error": "--sign-pages must be comma-separated integers"}))
+            sys.exit(1)
 
     result = sign_pdf(
         input_path=args.input,
@@ -453,6 +610,7 @@ def main():
         initials_all_pages=args.initials_all_pages,
         initials_text=args.initials_text,
         initials_image=args.initials_image,
+        sign_pages=sign_pages,
     )
 
     print(json.dumps(result, indent=2))
